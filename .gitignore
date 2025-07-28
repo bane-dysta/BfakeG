@@ -1,0 +1,7 @@
+fort/
+release/
+test/
+BDFakeG_win64.exe
+BDFakeG_linux
+*.sh
+*.bat
