@@ -43,9 +43,19 @@ private:
         double thermalGibbsCorr;
         bool hasData;
         
+        // 梯度收敛信息
+        double maxDeltaX;
+        double rmsDeltaX;
+        double maxForce;
+        double rmsForce;
+        double expectedDeltaE;
+        bool hasConvergenceData;
+        
         ThermoData() : temperature(298.15), pressure(1.0), electronicEnergy(0.0),
                        zpe(0.0), thermalEnergyCorr(0.0), thermalEnthalpyCorr(0.0),
-                       thermalGibbsCorr(0.0), hasData(false) {}
+                       thermalGibbsCorr(0.0), hasData(false),
+                       maxDeltaX(0.0), rmsDeltaX(0.0), maxForce(0.0), rmsForce(0.0),
+                       expectedDeltaE(0.0), hasConvergenceData(false) {}
     };
     
     std::vector<OptStep> optSteps;
@@ -220,9 +230,10 @@ private:
     
     void parseConvergence(std::ifstream& file, OptStep& step) {
         std::string line;
+        bool foundConvergence = false;
         
         // Look for convergence values after the current geometry
-        // The "Current values" line should appear after the coordinates for this step
+        // 改进的搜索逻辑：扩大搜索范围，不在"Good Job"处停止
         while (std::getline(file, line)) {
             if (line.find("Current values") != std::string::npos) {
                 // Parse the values from the same line or next line
@@ -233,6 +244,7 @@ private:
                 iss >> dummy >> dummy >> dummy;
                 
                 if (iss >> step.rmsGrad >> step.maxGrad >> step.rmsStep >> step.maxStep) {
+                    foundConvergence = true;
                     if (debugMode) {
                         std::cout << "Step " << step.stepNumber << " convergence: RMS Grad=" << step.rmsGrad 
                                  << ", Max Grad=" << step.maxGrad << ", RMS Step=" << step.rmsStep 
@@ -242,18 +254,30 @@ private:
                     // Values might be on the next line
                     if (std::getline(file, line)) {
                         std::istringstream iss2(line);
-                        iss2 >> step.rmsGrad >> step.maxGrad >> step.rmsStep >> step.maxStep;
+                        if (iss2 >> step.rmsGrad >> step.maxGrad >> step.rmsStep >> step.maxStep) {
+                            foundConvergence = true;
+                            if (debugMode) {
+                                std::cout << "Step " << step.stepNumber << " convergence (next line): RMS Grad=" << step.rmsGrad 
+                                         << ", Max Grad=" << step.maxGrad << ", RMS Step=" << step.rmsStep 
+                                         << ", Max Step=" << step.maxStep << std::endl;
+                            }
+                        }
                     }
                 }
                 break;
             }
             
-            // Stop if we hit the next optimization step or other sections
+            // 只在遇到下一个优化步骤或频率分析时停止，不在"Good Job"处停止
             if (line.find("Geometry Optimization step") != std::string::npos ||
-                line.find("Good Job") != std::string::npos ||
-                line.find("Results of vibrations") != std::string::npos) {
+                line.find("Results of vibrations") != std::string::npos ||
+                line.find("Start analytical Hessian") != std::string::npos) {
                 break;
             }
+        }
+        
+        // 如果没有找到收敛数据，设置默认值
+        if (!foundConvergence && debugMode) {
+            std::cout << "Warning: No convergence data found for step " << step.stepNumber << std::endl;
         }
         
         // Check if this step is converged
@@ -670,10 +694,85 @@ private:
                 }
             }
             
+            // Parse convergence information - format: "  Maximum Delta-X              0.000060      0.004000            Yes"
+            if (line.find("Maximum Delta-X") != std::string::npos) {
+                std::istringstream iss(line);
+                std::string word1, word2;
+                double value, tolerance;
+                std::string converged;
+                
+                if (iss >> word1 >> word2 >> value >> tolerance >> converged) {
+                    thermoData.maxDeltaX = value;
+                    thermoData.hasConvergenceData = true;
+                    if (debugMode) {
+                        std::cout << "DEBUG: Parsed Maximum Delta-X: " << thermoData.maxDeltaX << std::endl;
+                    }
+                }
+            }
+            else if (line.find("RMS Delta-X") != std::string::npos) {
+                std::istringstream iss(line);
+                std::string word1, word2;
+                double value, tolerance;
+                std::string converged;
+                
+                if (iss >> word1 >> word2 >> value >> tolerance >> converged) {
+                    thermoData.rmsDeltaX = value;
+                    if (debugMode) {
+                        std::cout << "DEBUG: Parsed RMS Delta-X: " << thermoData.rmsDeltaX << std::endl;
+                    }
+                }
+            }
+            else if (line.find("Maximum Force") != std::string::npos && line.find("Delta-X") == std::string::npos) {
+                std::istringstream iss(line);
+                std::string word1, word2;
+                double value, tolerance;
+                std::string converged;
+                
+                if (iss >> word1 >> word2 >> value >> tolerance >> converged) {
+                    thermoData.maxForce = value;
+                    if (debugMode) {
+                        std::cout << "DEBUG: Parsed Maximum Force: " << thermoData.maxForce << std::endl;
+                    }
+                }
+            }
+            else if (line.find("RMS Force") != std::string::npos) {
+                std::istringstream iss(line);
+                std::string word1, word2;
+                double value, tolerance;
+                std::string converged;
+                
+                if (iss >> word1 >> word2 >> value >> tolerance >> converged) {
+                    thermoData.rmsForce = value;
+                    if (debugMode) {
+                        std::cout << "DEBUG: Parsed RMS Force: " << thermoData.rmsForce << std::endl;
+                    }
+                }
+            }
+            else if (line.find("Expected Delta-E") != std::string::npos) {
+                // Parse scientific notation like "0.27D-08"
+                std::istringstream iss(line);
+                std::string word1, word2;
+                std::string valueStr, toleranceStr;
+                std::string converged;
+                
+                if (iss >> word1 >> word2 >> valueStr >> toleranceStr >> converged) {
+                    // Convert D notation to E notation
+                    std::replace(valueStr.begin(), valueStr.end(), 'D', 'E');
+                    try {
+                        thermoData.expectedDeltaE = std::stod(valueStr);
+                        if (debugMode) {
+                            std::cout << "DEBUG: Parsed Expected Delta-E: " << thermoData.expectedDeltaE << std::endl;
+                        }
+                    } catch (...) {
+                        if (debugMode) {
+                            std::cout << "DEBUG: Failed to parse Expected Delta-E: " << valueStr << std::endl;
+                        }
+                    }
+                }
+            }
+            
             // Stop when we reach the next major section - use more specific markers
-            if (line.find("Gradient Information") != std::string::npos ||
-                line.find("UniMoVib job terminated") != std::string::npos ||
-                line.find("Cartesian gradients") != std::string::npos) {
+            if (line.find("UniMoVib job terminated") != std::string::npos) {
                 if (debugMode) {
                     std::cout << "DEBUG: Reached end of thermo section at: " << line << std::endl;
                 }
@@ -692,6 +791,16 @@ private:
             std::cout << "Thermal correction to Energy: " << thermoData.thermalEnergyCorr << " Hartree" << std::endl;
             std::cout << "Thermal correction to Enthalpy: " << thermoData.thermalEnthalpyCorr << " Hartree" << std::endl;
             std::cout << "Thermal correction to Gibbs: " << thermoData.thermalGibbsCorr << " Hartree" << std::endl;
+            
+            std::cout << "\n=== Convergence Data Summary ===" << std::endl;
+            std::cout << "HasConvergenceData: " << (thermoData.hasConvergenceData ? "true" : "false") << std::endl;
+            if (thermoData.hasConvergenceData) {
+                std::cout << "Maximum Delta-X: " << thermoData.maxDeltaX << std::endl;
+                std::cout << "RMS Delta-X: " << thermoData.rmsDeltaX << std::endl;
+                std::cout << "Maximum Force: " << thermoData.maxForce << std::endl;
+                std::cout << "RMS Force: " << thermoData.rmsForce << std::endl;
+                std::cout << "Expected Delta-E: " << thermoData.expectedDeltaE << std::endl;
+            }
             std::cout << "=================================" << std::endl;
         }
     }
@@ -700,8 +809,10 @@ private:
         std::ofstream out(outputFile);
         
         // Header
-        out << "! This file was generated by BDFakeG version 1.0" << std::endl;
+        out << "! This file was generated by BDFakeG version 1.1" << std::endl;
         out << "! Converted from BDF format to Gaussian format" << std::endl;
+        out << "! Author: Bane Dysta" << std::endl;
+        out << "! Report Bug: http://bbs.keinsci.com/thread-54870-1-1.html" << std::endl;
         out << std::endl;
         out << "0 basis functions" << std::endl;
         out << "0 alpha electrons" << std::endl;
@@ -897,6 +1008,38 @@ private:
             out << " Sum of electronic and thermal Energies=     " << std::setprecision(6) << std::setw(20) << (thermoData.electronicEnergy + thermoData.thermalEnergyCorr) << std::endl;
             out << " Sum of electronic and thermal Enthalpies=   " << std::setprecision(6) << std::setw(20) << (thermoData.electronicEnergy + thermoData.thermalEnthalpyCorr) << std::endl;
             out << " Sum of electronic and thermal Free Energies=" << std::setprecision(6) << std::setw(20) << (thermoData.electronicEnergy + thermoData.thermalGibbsCorr) << std::endl;
+        }
+        
+        // 输出收敛信息
+        if (thermoData.hasConvergenceData) {
+            out << std::endl;
+            out << " Convergence of gradients" << std::endl;
+            out << "                                  Value     Tolerance      Converged?" << std::endl;
+            
+            // Maximum Delta-X
+            out << "  Maximum Delta-X          " << std::fixed << std::setprecision(6) << std::setw(12) << thermoData.maxDeltaX
+                << std::setw(13) << "0.004000" << "            " 
+                << (thermoData.maxDeltaX < 0.004000 ? "Yes" : "No") << std::endl;
+            
+            // RMS Delta-X  
+            out << "      RMS Delta-X          " << std::setw(12) << thermoData.rmsDeltaX
+                << std::setw(13) << "0.002500" << "            "
+                << (thermoData.rmsDeltaX < 0.002500 ? "Yes" : "No") << std::endl;
+            
+            // Maximum Force
+            out << "    Maximum Force          " << std::setw(12) << thermoData.maxForce
+                << std::setw(13) << "0.000800" << "            "
+                << (thermoData.maxForce < 0.000800 ? "Yes" : "No") << std::endl;
+            
+            // RMS Force
+            out << "        RMS Force          " << std::setw(12) << thermoData.rmsForce
+                << std::setw(13) << "0.000500" << "            "
+                << (thermoData.rmsForce < 0.000500 ? "Yes" : "No") << std::endl;
+            
+            // Expected Delta-E (scientific notation)
+            out << " Expected Delta-E          " << std::scientific << std::setprecision(2) << std::setw(12) << thermoData.expectedDeltaE
+                << std::setw(13) << "0.50E-05" << "            "
+                << (thermoData.expectedDeltaE < 0.50e-05 ? "Yes" : "No") << std::endl;
         }
     }
 
